@@ -4,7 +4,7 @@
   * Description        : Main program body
   ******************************************************************************
   *
-  * COPYRIGHT(c) 2016 STMicroelectronics
+  * COPYRIGHT(c) 2017 STMicroelectronics
   *
   * Redistribution and use in source and binary forms, with or without modification,
   * are permitted provided that the following conditions are met:
@@ -35,32 +35,178 @@
 #include "stm32f1xx_hal.h"
 
 /* USER CODE BEGIN Includes */
-
+//#include "lcd.h"
+#include "yahdlc/yahdlc.h"
+#include "circular_buffer.h"
+#include "nf/nfv2.h"
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart2;
+DMA_HandleTypeDef hdma_uart4_rx;
+DMA_HandleTypeDef hdma_uart4_tx;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
+Buffer uart4RxBuffer;
+char uart4TxBuffer[128];
+Buffer uart2RxBuffer;
+Buffer uart2TxBuffer;
+char uart4Received[64];
+char uart2Received;
+char uart4Tx;
+int drives_left_velocity = 0;
+int drives_right_velocity = 0;
 
+//Obiekty i struktury biblioteki NFv2
+NF_STRUCT_ComBuf drives_NFCommunicationBuffer;	//Bufor komunikacyjny biblioteki NFv2.
+uint8_t drives_txBuffer[256];	//Dane wysylane do plytki.
+uint8_t drives_txCount;		//Dlugosc danych wysylanych do plytki.
+uint8_t drives_commandArray[256];	//Tablica polecen do sterownika.
+uint8_t drives_commandCount;		//Stopien zapelnienia tablicy polecen do sterownika.
+uint8_t drives_rxCommandArray[256];	//Tablica danych przychodz¹cych od p³ytki.
+uint8_t drives_rxCommandCount;	//Stopien zapelnienia tablicy danych od p³ytki.
+uint8_t drives_rxBuffer[256];	//Dane odebrane do plytki.
+uint8_t drives_rxCount = 0;		//Dlugosc danych odebranych od plytki.
+double drives_l_pos_total=0;	//Aktualna pozycja kola prawego w SI [m].
+double drives_r_pos_total=0;	//Aktualna pozycja kola lewego w SI [m].
+double drives_l_speed_pic = 0;
+double drives_r_speed_pic = 0;
+
+//Obiekty i struktury do komunikacji z pc
+char pc_rx_buffer[256];
+short pc_rx_iter = 0;
+unsigned last_timestamp = 0;
+unsigned counter = 0;
+
+typedef struct{
+	unsigned id;
+	unsigned tx_timestamp;
+	unsigned rx_timestamp;
+	short left_drive_speed;
+	short right_drive_speed;
+	char relays;
+	char shutdown;
+	char sound;
+	//char lcd_segment;
+	//char lcd_message[13];
+}TxPackage;
+
+typedef struct{
+	unsigned id;
+	unsigned tx_timestamp;
+	unsigned rx_timestamp;
+	double left_drive_position;
+	double right_drive_position;
+	char buttons;
+	char shutdown;
+}RxPackage;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 void Error_Handler(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
-
+int drives_rx_handler(char newRx);
+int pc_rx_handler(char newRx);
 /* USER CODE END PFP */
 
 /* USER CODE BEGIN 0 */
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef * huart) {
+	if(huart->Instance == huart2.Instance){
+		HAL_GPIO_WritePin(USART2_TXEN_GPIO_Port, USART2_TXEN_Pin, GPIO_PIN_RESET);
+	}
+}
 
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
+	if(huart->Instance == huart2.Instance){
+		buffer_put(uart2Received, &uart2RxBuffer);
+		HAL_UART_Receive_IT(&huart2, &uart2Received, 1);
+	}
+	if(huart->Instance == huart4.Instance){
+		buffer_putn(uart4Received, sizeof(uart4Received), &uart4RxBuffer);
+  		HAL_UART_Receive_DMA(&huart4, uart4Received, sizeof(uart4Received));
+	}
+}
+void drives_set_speed_request(int left, int right){
+	drives_commandCount = 0;
+	drives_NFCommunicationBuffer.SetDrivesMode.data[0] = NF_DrivesMode_SPEED;
+	drives_NFCommunicationBuffer.SetDrivesMode.data[1] = NF_DrivesMode_SPEED;
+	drives_NFCommunicationBuffer.SetDrivesSpeed.data[0] = left;
+	drives_NFCommunicationBuffer.SetDrivesSpeed.data[1] = right;
+	drives_commandArray[drives_commandCount++] = NF_COMMAND_SetDrivesMode;
+	drives_commandArray[drives_commandCount++] = NF_COMMAND_SetDrivesSpeed;
+	drives_commandArray[drives_commandCount++] = NF_COMMAND_ReadDeviceVitals;
+	drives_commandArray[drives_commandCount++] = NF_COMMAND_ReadDrivesPosition;
+	drives_txCount = NF_MakeCommandFrame(&drives_NFCommunicationBuffer, drives_txBuffer,
+			(const uint8_t*)drives_commandArray, drives_commandCount, 0x10);
+	HAL_GPIO_WritePin(USART2_TXEN_GPIO_Port, USART2_TXEN_Pin, GPIO_PIN_SET);
+	HAL_UART_Transmit_IT(&huart2, drives_txBuffer, drives_txCount);
+}
+
+int drives_rx_handler(char newRx){
+	int ret = 0;
+	if(drives_rxCount == 255){
+		drives_rxCount = 0;
+	}
+	drives_rxBuffer[drives_rxCount] = newRx;
+	if(NF_Interpreter(&drives_NFCommunicationBuffer, drives_rxBuffer, &drives_rxCount, drives_rxCommandArray, &drives_rxCommandCount) > 0){
+		if(drives_NFCommunicationBuffer.ReadDrivesPosition.updated){
+			drives_l_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[0];
+			drives_r_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[1];
+		 	drives_NFCommunicationBuffer.ReadDrivesPosition.updated=0;
+		 	ret = 1;
+		}
+	}
+	return ret;
+}
+
+int pc_rx_handler(char newRx){
+	int got_message = 0;
+	unsigned int message_length = 0;
+	TxPackage package;
+	yahdlc_control_t control_recv;
+	pc_rx_buffer[pc_rx_iter] = newRx;
+	pc_rx_iter++;
+    pc_rx_iter &= 0xff;
+    if(pc_rx_iter >= sizeof(TxPackage)){
+    	yahdlc_get_data(&control_recv, pc_rx_buffer, pc_rx_iter, (char*)(&package), &message_length);
+    	got_message = (message_length > 2);
+    }
+	if(got_message){
+		pc_rx_iter = 0;
+	}
+	got_message = (got_message && package.tx_timestamp != last_timestamp);
+	if(got_message){
+		last_timestamp = package.tx_timestamp;
+		drives_left_velocity = package.left_drive_speed;
+		drives_right_velocity = package.right_drive_speed;
+	}
+	return got_message;
+}
+
+void send_pc_response(){
+	RxPackage package;
+	package.tx_timestamp = last_timestamp;
+	package.rx_timestamp = counter;
+	++counter;
+	package.left_drive_position = drives_l_pos_total;
+	package.right_drive_position = drives_r_pos_total;
+	yahdlc_control_t control;
+	// Initialize the control field structure with frame type and sequence number
+	control.frame = YAHDLC_FRAME_DATA;
+	// Create an empty frame with the control field information
+	unsigned frame_length;
+	yahdlc_frame_data(&control, (char *)(&package), sizeof(RxPackage), uart4TxBuffer, &frame_length);
+	HAL_UART_Transmit_DMA(&huart4, uart4TxBuffer, frame_length);
+}
 /* USER CODE END 0 */
 
 int main(void)
@@ -80,17 +226,64 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_UART4_Init();
   MX_USART2_UART_Init();
 
   /* USER CODE BEGIN 2 */
+    NFv2_CrcInit();
+    NFv2_Config(&drives_NFCommunicationBuffer, 0x01);
+    //drives connection init
+    buffer_init(&uart2RxBuffer);
+    HAL_GPIO_WritePin(USART2_TXEN_GPIO_Port, USART2_TXEN_Pin, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(DIO6_GPIO_Port, DIO6_Pin, GPIO_PIN_SET);
+    HAL_GPIO_WritePin(DIO7_GPIO_Port, DIO7_Pin, GPIO_PIN_SET);
+    HAL_UART_Receive_IT(&huart2, &uart2Received, sizeof(uart2Received));
+    drives_set_speed_request(100, 100);
 
+    //pc connection init
+    buffer_init(&uart4RxBuffer);
+    HAL_UART_Receive_DMA(&huart4, &uart4Received, sizeof(uart4Received));
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+    int i = 0;
+    int j = 0;
+    drives_left_velocity = 50;
+    drives_right_velocity = 50;
   while (1)
   {
+	  NVIC_DisableIRQ(DMA2_Channel5_IRQn);
+		char uart4Rx;
+		char newUart4Rx = buffer_get(&uart4RxBuffer, &uart4Rx);
+		NVIC_EnableIRQ(DMA2_Channel5_IRQn);
+		if (newUart4Rx){
+			pc_rx_handler(uart4Rx);
+		}
+
+	  HAL_NVIC_DisableIRQ(USART2_IRQn);
+		char uart2Rx;
+		char newUart2Rx = buffer_get(&uart2RxBuffer, &uart2Rx);
+		HAL_NVIC_EnableIRQ(USART2_IRQn);
+		if (newUart2Rx){
+			if(drives_rx_handler(uart2Rx)){
+				send_pc_response();
+			}
+		}
+		if(i == 10000){
+			drives_set_speed_request(50, 50);
+			HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
+			i = 0;
+			j++;
+			if(j == 100){
+				j = 0;
+			}
+		}
+		++i;
+		//HAL_Delay(2);
+	  //drives_set_speed_request(100, 100);
+	  //HAL_Delay(1);
   /* USER CODE END WHILE */
 
   /* USER CODE BEGIN 3 */
@@ -112,7 +305,7 @@ void SystemClock_Config(void)
     */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
-  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV1;
+  RCC_OscInitStruct.HSEPredivValue = RCC_HSE_PREDIV_DIV2;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.Prediv1Source = RCC_PREDIV1_SOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
@@ -137,8 +330,6 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
-
-  HAL_RCC_MCOConfig(RCC_MCO, RCC_MCO1SOURCE_HSE, RCC_MCODIV_1);
 
     /**Configure the Systick interrupt time 
     */
@@ -194,13 +385,30 @@ static void MX_USART2_UART_Init(void)
 
 }
 
+/** 
+  * Enable DMA controller clock
+  */
+static void MX_DMA_Init(void) 
+{
+  /* DMA controller clock enable */
+  __HAL_RCC_DMA2_CLK_ENABLE();
+
+  /* DMA interrupt init */
+  /* DMA2_Channel3_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel3_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel3_IRQn);
+  /* DMA2_Channel5_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA2_Channel5_IRQn, 0, 0);
+  HAL_NVIC_EnableIRQ(DMA2_Channel5_IRQn);
+
+}
+
 /** Configure pins as 
         * Analog 
         * Input 
         * Output
         * EVENT_OUT
         * EXTI
-     PA8   ------> RCC_MCO
 */
 static void MX_GPIO_Init(void)
 {
@@ -241,12 +449,6 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
-
-  /*Configure GPIO pin : PA8 */
-  GPIO_InitStruct.Pin = GPIO_PIN_8;
-  GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin : USART2_TXEN_Pin */
   GPIO_InitStruct.Pin = USART2_TXEN_Pin;

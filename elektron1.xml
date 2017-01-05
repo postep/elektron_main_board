@@ -2,8 +2,8 @@
 <targetDefinitions xmlns="http://openstm32.org/stm32TargetDefinitions" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://openstm32.org/stm32TargetDefinitions stm32TargetDefinitions.xsd">
   <board id="elektron1">
     <name>elektron1</name>
-    <mcuId>STM32F107VCTx</mcuId>  <!-- mcu-->
+    <mcuId>stm32f107vctx</mcuId>
     <dbgIF>JTAG</dbgIF>
-    <dbgDEV />
+    <dbgDEV>ST-LinkV2</dbgDEV>
   </board>
 </targetDefinitions>
