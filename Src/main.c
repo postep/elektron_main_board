@@ -76,10 +76,12 @@ osMessageQId setMotorsQueueHandle;
 osMutexId batteryMutexHandle;
 osMutexId drivesSpeedMutexHandle;
 osMutexId drivesPositionMutexHandle;
+osMutexId relaysMutexHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 uint16_t battery_voltage_adc;
+uint8_t relays;
 Buffer uart4RxBuffer;
 char uart4TxBuffer[128];
 Buffer uart2RxBuffer;
@@ -288,6 +290,10 @@ int main(void)
   /* definition and creation of drivesPositionMutex */
   osMutexDef(drivesPositionMutex);
   drivesPositionMutexHandle = osMutexCreate(osMutex(drivesPositionMutex));
+
+  /* definition and creation of relaysMutex */
+  osMutexDef(relaysMutex);
+  relaysMutexHandle = osMutexCreate(osMutex(relaysMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -600,16 +606,16 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DIO1_Pin DIO2_Pin LCD_DB0_Pin */
-  GPIO_InitStruct.Pin = DIO1_Pin|DIO2_Pin|LCD_DB0_Pin;
+  /*Configure GPIO pins : REL1_Pin REL3_Pin LCD_DB0_Pin */
+  GPIO_InitStruct.Pin = REL1_Pin|REL3_Pin|LCD_DB0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DIO3_Pin DIO4_Pin DIO5_Pin DIO6_Pin 
+  /*Configure GPIO pins : REL2_Pin ROBOT_OFF_Pin REL4_Pin DIO6_Pin 
                            DIO7_Pin LCD_DB4_Pin LCD_DB3_Pin LCD_DB2_Pin 
                            LCD_DB1_Pin */
-  GPIO_InitStruct.Pin = DIO3_Pin|DIO4_Pin|DIO5_Pin|DIO6_Pin 
+  GPIO_InitStruct.Pin = REL2_Pin|ROBOT_OFF_Pin|REL4_Pin|DIO6_Pin 
                           |DIO7_Pin|LCD_DB4_Pin|LCD_DB3_Pin|LCD_DB2_Pin 
                           |LCD_DB1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -634,10 +640,10 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(GPIOC, ST_LED_Pin|LCD_RST_Pin|LCD_RW_Pin|LCD_LED_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, DIO1_Pin|DIO2_Pin|LCD_DB0_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, REL1_Pin|REL3_Pin|LCD_DB0_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOE, DIO3_Pin|DIO4_Pin|DIO5_Pin|DIO6_Pin 
+  HAL_GPIO_WritePin(GPIOE, REL2_Pin|ROBOT_OFF_Pin|REL4_Pin|DIO6_Pin 
                           |DIO7_Pin|LCD_DB4_Pin|LCD_DB3_Pin|LCD_DB2_Pin 
                           |LCD_DB1_Pin, GPIO_PIN_RESET);
 
@@ -675,8 +681,21 @@ void StartOutTask(void const * argument)
   /* Infinite loop */
 	LCD_init();
 	LCD_clear();
+	LCD_writeLine(4, "              1 2 3 4");
   for(;;)
   {
+	  uint8_t temp_relays = 0x55;
+	  xSemaphoreTake(relaysMutexHandle, portTICK_PERIOD_MS*4);
+	  //temp_relays = relays;
+	  xSemaphoreGive(relaysMutexHandle);
+	  char rel1 = (temp_relays & 0x01);
+	  char rel2 = (temp_relays & 0x02);
+	  char rel3 = (temp_relays & 0x04);
+	  char rel4 = (temp_relays & 0x08);
+	  HAL_GPIO_WritePin(REL1_GPIO_Port, REL1_Pin, rel1);
+	  HAL_GPIO_WritePin(REL2_GPIO_Port, REL2_Pin, rel2);
+	  HAL_GPIO_WritePin(REL3_GPIO_Port, REL3_Pin, rel3);
+	  HAL_GPIO_WritePin(REL4_GPIO_Port, REL4_Pin, rel4);
 	int battery_copy = 0;
 	xSemaphoreTake(batteryMutexHandle, portMAX_DELAY);
 	battery_copy = battery_voltage_adc;
@@ -687,7 +706,7 @@ void StartOutTask(void const * argument)
 		int battery_int = battery_copy/100;
 		int battery_decimal = battery_copy%100;
 		char string[20];
-		sprintf(string, "Bateria:  %d.%dV     ", battery_int, battery_decimal);
+		sprintf(string, "Bateria:      %d.%dV     ", battery_int, battery_decimal);
 		LCD_writeLine(0, string);
 		if(battery_copy < 2200){
 			LCD_writeLine(1, "BATERIA ROZLADOWANA");
@@ -695,6 +714,18 @@ void StartOutTask(void const * argument)
 			LCD_writeLine(1, "                   ");
 		}
 	}
+	char relayString[21];
+	memcpy(relayString, "Przekazniki:  ", 14);
+	relayString[13] = ' ';
+	relayString[15] = ' ';
+	relayString[17] = ' ';
+	relayString[19] = ' ';
+	if (rel1) {relayString[14] = '*';} else {relayString[14] = '.';}
+	if (rel2) {relayString[16] = '*';} else {relayString[16] = '.';}
+	if (rel3) {relayString[18] = '*';} else {relayString[18] = '.';}
+	if (rel4) {relayString[20] = '*';} else {relayString[20] = '.';}
+	relayString[21] = '\0';
+	LCD_writeLine(5, relayString);
     osDelay(2000);
   }
   /* USER CODE END StartOutTask */
