@@ -42,6 +42,10 @@
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef hadc1;
+
+TIM_HandleTypeDef htim3;
+
 UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_uart4_rx;
@@ -49,6 +53,7 @@ DMA_HandleTypeDef hdma_uart4_tx;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
+uint16_t battery_voltage_adc;
 Buffer uart4RxBuffer;
 char uart4TxBuffer[128];
 Buffer uart2RxBuffer;
@@ -101,6 +106,7 @@ typedef struct{
 	double right_drive_position;
 	char buttons;
 	char shutdown;
+	short battery;
 }RxPackage;
 /* USER CODE END PV */
 
@@ -111,6 +117,8 @@ static void MX_GPIO_Init(void);
 static void MX_DMA_Init(void);
 static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_TIM3_Init(void);
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
@@ -134,6 +142,10 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 		buffer_putn(uart4Received, sizeof(uart4Received), &uart4RxBuffer);
   		HAL_UART_Receive_DMA(&huart4, uart4Received, sizeof(uart4Received));
 	}
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
+	HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
 }
 void drives_set_speed_request(int left, int right){
 	drives_commandCount = 0;
@@ -199,6 +211,7 @@ void send_pc_response(){
 	++counter;
 	package.left_drive_position = drives_l_pos_total;
 	package.right_drive_position = drives_r_pos_total;
+	package.battery = battery_voltage_adc;
 	yahdlc_control_t control;
 	// Initialize the control field structure with frame type and sequence number
 	control.frame = YAHDLC_FRAME_DATA;
@@ -229,6 +242,8 @@ int main(void)
   MX_DMA_Init();
   MX_UART4_Init();
   MX_USART2_UART_Init();
+  MX_ADC1_Init();
+  MX_TIM3_Init();
 
   /* USER CODE BEGIN 2 */
     NFv2_CrcInit();
@@ -239,19 +254,23 @@ int main(void)
     HAL_GPIO_WritePin(DIO6_GPIO_Port, DIO6_Pin, GPIO_PIN_SET);
     HAL_GPIO_WritePin(DIO7_GPIO_Port, DIO7_Pin, GPIO_PIN_SET);
     HAL_UART_Receive_IT(&huart2, &uart2Received, sizeof(uart2Received));
-    drives_set_speed_request(100, 100);
+    //drives_set_speed_request(0, 0);
 
     //pc connection init
     buffer_init(&uart4RxBuffer);
     HAL_UART_Receive_DMA(&huart4, &uart4Received, sizeof(uart4Received));
+
+    //battery voltage measure init
+    HAL_TIM_Base_Start_IT(&htim6);
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
     int i = 0;
     int j = 0;
-    drives_left_velocity = 50;
-    drives_right_velocity = 50;
+    drives_left_velocity = 0;
+    drives_right_velocity = 0;
   while (1)
   {
 	  NVIC_DisableIRQ(DMA2_Channel5_IRQn);
@@ -271,14 +290,18 @@ int main(void)
 				send_pc_response();
 			}
 		}
+		HAL_ADC_Start(&hadc1);
+		    if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK){
+		    	battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
+		    }else{
+		    	HAL_Delay(1);
+		    }
 		if(i == 10000){
-			drives_set_speed_request(50, 50);
-			HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
+			int temp_l = drives_left_velocity;
+			int temp_r = drives_right_velocity;
+			drives_set_speed_request(temp_l, temp_r);
+			//HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
 			i = 0;
-			j++;
-			if(j == 100){
-				j = 0;
-			}
 		}
 		++i;
 		//HAL_Delay(2);
@@ -300,6 +323,7 @@ void SystemClock_Config(void)
 
   RCC_OscInitTypeDef RCC_OscInitStruct;
   RCC_ClkInitTypeDef RCC_ClkInitStruct;
+  RCC_PeriphCLKInitTypeDef PeriphClkInit;
 
     /**Initializes the CPU, AHB and APB busses clocks 
     */
@@ -331,6 +355,13 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_ADC;
+  PeriphClkInit.AdcClockSelection = RCC_ADCPCLK2_DIV6;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
     /**Configure the Systick interrupt time 
     */
   HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq()/1000);
@@ -345,6 +376,70 @@ void SystemClock_Config(void)
 
   /* SysTick_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+}
+
+/* ADC1 init function */
+static void MX_ADC1_Init(void)
+{
+
+  ADC_ChannelConfTypeDef sConfig;
+
+    /**Common config 
+    */
+  hadc1.Instance = ADC1;
+  hadc1.Init.ScanConvMode = ADC_SCAN_DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConv = ADC_EXTERNALTRIGCONV_T3_TRGO;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+    /**Configure Regular Channel 
+    */
+  sConfig.Channel = ADC_CHANNEL_4;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_1CYCLE_5;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+}
+
+/* TIM3 init function */
+static void MX_TIM3_Init(void)
+{
+
+  TIM_ClockConfigTypeDef sClockSourceConfig;
+  TIM_MasterConfigTypeDef sMasterConfig;
+
+  htim3.Instance = TIM3;
+  htim3.Init.Prescaler = 10000;
+  htim3.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim3.Init.Period = 7000;
+  htim3.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  if (HAL_TIM_Base_Init(&htim3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim3, &sClockSourceConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim3, &sMasterConfig) != HAL_OK)
+  {
+    Error_Handler();
+  }
+
 }
 
 /* UART4 init function */
@@ -418,8 +513,8 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOE_CLK_ENABLE();
   __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pins : KEY_1_Pin KEY_2_Pin KEY_3_Pin KEY_4_Pin 

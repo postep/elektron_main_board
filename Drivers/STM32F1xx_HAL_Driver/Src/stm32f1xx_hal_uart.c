@@ -1562,7 +1562,6 @@ static void UART_DMATransmitCplt(DMA_HandleTypeDef *hdma)
     CLEAR_BIT(huart->Instance->CR3, USART_CR3_DMAT);
 
     /* Enable the UART Transmit Complete Interrupt */    
-    huart->State=HAL_UART_STATE_READY;
     __HAL_UART_ENABLE_IT(huart, UART_IT_TC);
   }
   /* DMA Circular mode */
