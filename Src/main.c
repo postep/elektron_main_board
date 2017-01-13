@@ -4,35 +4,46 @@
   * Description        : Main program body
   ******************************************************************************
   *
-  * COPYRIGHT(c) 2017 STMicroelectronics
+  * Copyright (c) 2017 STMicroelectronics International N.V. 
+  * All rights reserved.
   *
-  * Redistribution and use in source and binary forms, with or without modification,
-  * are permitted provided that the following conditions are met:
-  *   1. Redistributions of source code must retain the above copyright notice,
-  *      this list of conditions and the following disclaimer.
-  *   2. Redistributions in binary form must reproduce the above copyright notice,
-  *      this list of conditions and the following disclaimer in the documentation
-  *      and/or other materials provided with the distribution.
-  *   3. Neither the name of STMicroelectronics nor the names of its contributors
-  *      may be used to endorse or promote products derived from this software
-  *      without specific prior written permission.
+  * Redistribution and use in source and binary forms, with or without 
+  * modification, are permitted, provided that the following conditions are met:
   *
-  * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-  * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-  * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-  * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-  * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-  * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+  * 1. Redistribution of source code must retain the above copyright notice, 
+  *    this list of conditions and the following disclaimer.
+  * 2. Redistributions in binary form must reproduce the above copyright notice,
+  *    this list of conditions and the following disclaimer in the documentation
+  *    and/or other materials provided with the distribution.
+  * 3. Neither the name of STMicroelectronics nor the names of other 
+  *    contributors to this software may be used to endorse or promote products 
+  *    derived from this software without specific written permission.
+  * 4. This software, including modifications and/or derivative works of this 
+  *    software, must execute solely and exclusively on microcontroller or
+  *    microprocessor devices manufactured by or for STMicroelectronics.
+  * 5. Redistribution and use of this software other than as permitted under 
+  *    this license is void and will automatically terminate your rights under 
+  *    this license. 
+  *
+  * THIS SOFTWARE IS PROVIDED BY STMICROELECTRONICS AND CONTRIBUTORS "AS IS" 
+  * AND ANY EXPRESS, IMPLIED OR STATUTORY WARRANTIES, INCLUDING, BUT NOT 
+  * LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY, FITNESS FOR A 
+  * PARTICULAR PURPOSE AND NON-INFRINGEMENT OF THIRD PARTY INTELLECTUAL PROPERTY
+  * RIGHTS ARE DISCLAIMED TO THE FULLEST EXTENT PERMITTED BY LAW. IN NO EVENT 
+  * SHALL STMICROELECTRONICS OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  * LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, 
+  * OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF 
+  * LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING 
+  * NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+  * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
   *
   ******************************************************************************
   */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "stm32f1xx_hal.h"
+#include "cmsis_os.h"
 
 /* USER CODE BEGIN Includes */
 //#include "lcd.h"
@@ -50,6 +61,13 @@ UART_HandleTypeDef huart4;
 UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_uart4_rx;
 DMA_HandleTypeDef hdma_uart4_tx;
+
+osThreadId defaultTaskHandle;
+osThreadId outTaskHandle;
+osThreadId motorsTaskHandle;
+osThreadId pcTaskHandle;
+osThreadId buttonsTaskHandle;
+osThreadId shutdownTaskHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
@@ -119,6 +137,12 @@ static void MX_UART4_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_ADC1_Init(void);
 static void MX_TIM3_Init(void);
+void StartDefaultTask(void const * argument);
+void StartOutTask(void const * argument);
+void StartMotorsTask(void const * argument);
+void StartPcTask(void const * argument);
+void StartButtonsTask(void const * argument);
+void StartShutdownTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
@@ -144,9 +168,6 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 	}
 }
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim){
-	HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
-}
 void drives_set_speed_request(int left, int right){
 	drives_commandCount = 0;
 	drives_NFCommunicationBuffer.SetDrivesMode.data[0] = NF_DrivesMode_SPEED;
@@ -178,30 +199,6 @@ int drives_rx_handler(char newRx){
 		}
 	}
 	return ret;
-}
-
-int pc_rx_handler(char newRx){
-	int got_message = 0;
-	unsigned int message_length = 0;
-	TxPackage package;
-	yahdlc_control_t control_recv;
-	pc_rx_buffer[pc_rx_iter] = newRx;
-	pc_rx_iter++;
-    pc_rx_iter &= 0xff;
-    if(pc_rx_iter >= sizeof(TxPackage)){
-    	yahdlc_get_data(&control_recv, pc_rx_buffer, pc_rx_iter, (char*)(&package), &message_length);
-    	got_message = (message_length > 2);
-    }
-	if(got_message){
-		pc_rx_iter = 0;
-	}
-	got_message = (got_message && package.tx_timestamp != last_timestamp);
-	if(got_message){
-		last_timestamp = package.tx_timestamp;
-		drives_left_velocity = package.left_drive_speed;
-		drives_right_velocity = package.right_drive_speed;
-	}
-	return got_message;
 }
 
 void send_pc_response(){
@@ -261,9 +258,60 @@ int main(void)
     HAL_UART_Receive_DMA(&huart4, &uart4Received, sizeof(uart4Received));
 
     //battery voltage measure init
-    HAL_TIM_Base_Start_IT(&htim6);
+    //HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
+
+  /* USER CODE BEGIN RTOS_MUTEX */
+  /* add mutexes, ... */
+  /* USER CODE END RTOS_MUTEX */
+
+  /* USER CODE BEGIN RTOS_SEMAPHORES */
+  /* add semaphores, ... */
+  /* USER CODE END RTOS_SEMAPHORES */
+
+  /* USER CODE BEGIN RTOS_TIMERS */
+  /* start timers, add new ones, ... */
+  /* USER CODE END RTOS_TIMERS */
+
+  /* Create the thread(s) */
+  /* definition and creation of defaultTask */
+  osThreadDef(defaultTask, StartDefaultTask, osPriorityNormal, 0, 128);
+  defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
+
+  /* definition and creation of outTask */
+  osThreadDef(outTask, StartOutTask, osPriorityLow, 0, 128);
+  outTaskHandle = osThreadCreate(osThread(outTask), NULL);
+
+  /* definition and creation of motorsTask */
+  osThreadDef(motorsTask, StartMotorsTask, osPriorityRealtime, 0, 512);
+  motorsTaskHandle = osThreadCreate(osThread(motorsTask), NULL);
+
+  /* definition and creation of pcTask */
+  osThreadDef(pcTask, StartPcTask, osPriorityHigh, 0, 512);
+  pcTaskHandle = osThreadCreate(osThread(pcTask), NULL);
+
+  /* definition and creation of buttonsTask */
+  osThreadDef(buttonsTask, StartButtonsTask, osPriorityLow, 0, 128);
+  buttonsTaskHandle = osThreadCreate(osThread(buttonsTask), NULL);
+
+  /* definition and creation of shutdownTask */
+  osThreadDef(shutdownTask, StartShutdownTask, osPriorityIdle, 0, 128);
+  shutdownTaskHandle = osThreadCreate(osThread(shutdownTask), NULL);
+
+  /* USER CODE BEGIN RTOS_THREADS */
+  /* add threads, ... */
+  /* USER CODE END RTOS_THREADS */
+
+  /* USER CODE BEGIN RTOS_QUEUES */
+  /* add queues, ... */
+  /* USER CODE END RTOS_QUEUES */
+ 
+
+  /* Start scheduler */
+  osKernelStart();
+  
+  /* We should never get here as control is now taken by the scheduler */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -273,23 +321,7 @@ int main(void)
     drives_right_velocity = 0;
   while (1)
   {
-	  NVIC_DisableIRQ(DMA2_Channel5_IRQn);
-		char uart4Rx;
-		char newUart4Rx = buffer_get(&uart4RxBuffer, &uart4Rx);
-		NVIC_EnableIRQ(DMA2_Channel5_IRQn);
-		if (newUart4Rx){
-			pc_rx_handler(uart4Rx);
-		}
 
-	  HAL_NVIC_DisableIRQ(USART2_IRQn);
-		char uart2Rx;
-		char newUart2Rx = buffer_get(&uart2RxBuffer, &uart2Rx);
-		HAL_NVIC_EnableIRQ(USART2_IRQn);
-		if (newUart2Rx){
-			if(drives_rx_handler(uart2Rx)){
-				send_pc_response();
-			}
-		}
 		HAL_ADC_Start(&hadc1);
 		    if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK){
 		    	battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
@@ -375,7 +407,7 @@ void SystemClock_Config(void)
   __HAL_RCC_PLLI2S_ENABLE();
 
   /* SysTick_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(SysTick_IRQn, 15, 0);
 }
 
 /* ADC1 init function */
@@ -490,10 +522,10 @@ static void MX_DMA_Init(void)
 
   /* DMA interrupt init */
   /* DMA2_Channel3_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel3_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Channel3_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel3_IRQn);
   /* DMA2_Channel5_IRQn interrupt configuration */
-  HAL_NVIC_SetPriority(DMA2_Channel5_IRQn, 0, 0);
+  HAL_NVIC_SetPriority(DMA2_Channel5_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Channel5_IRQn);
 
 }
@@ -569,6 +601,138 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /* USER CODE END 4 */
+
+/* StartDefaultTask function */
+void StartDefaultTask(void const * argument)
+{
+
+  /* USER CODE BEGIN 5 */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(100);
+    HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
+  }
+  /* USER CODE END 5 */ 
+}
+
+/* StartOutTask function */
+void StartOutTask(void const * argument)
+{
+  /* USER CODE BEGIN StartOutTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartOutTask */
+}
+
+/* StartMotorsTask function */
+void StartMotorsTask(void const * argument)
+{
+  /* USER CODE BEGIN StartMotorsTask */
+  /* Infinite loop */
+  for(;;)
+  {
+	HAL_NVIC_DisableIRQ(USART2_IRQn);
+	char uart2Rx;
+	char newUart2Rx = buffer_get(&uart2RxBuffer, &uart2Rx);
+	HAL_NVIC_EnableIRQ(USART2_IRQn);
+	if (newUart2Rx){
+		if(drives_rx_handler(uart2Rx)){
+			send_pc_response();
+		}
+	}else{
+		osDelay(3);
+	}
+  }
+  /* USER CODE END StartMotorsTask */
+}
+
+/* StartPcTask function */
+void StartPcTask(void const * argument)
+{
+  /* USER CODE BEGIN StartPcTask */
+  /* Infinite loop */
+  for(;;)
+  {
+	NVIC_DisableIRQ(DMA2_Channel5_IRQn);
+	char uart4Rx;
+	char newUart4Rx = buffer_get(&uart4RxBuffer, &uart4Rx);
+	NVIC_EnableIRQ(DMA2_Channel5_IRQn);
+	if (newUart4Rx){
+		int got_message = 0;
+		unsigned int message_length = 0;
+		TxPackage package;
+		yahdlc_control_t control_recv;
+		pc_rx_buffer[pc_rx_iter] = uart4Rx;
+		pc_rx_iter++;
+		pc_rx_iter &= 0xff;
+		if(pc_rx_iter >= sizeof(TxPackage)){
+			yahdlc_get_data(&control_recv, pc_rx_buffer, pc_rx_iter, (char*)(&package), &message_length);
+			got_message = (message_length > 2);
+		}
+		if(got_message){
+			pc_rx_iter = 0;
+		}
+		got_message = (got_message && package.tx_timestamp != last_timestamp);
+		if(got_message){
+			last_timestamp = package.tx_timestamp;
+			drives_left_velocity = package.left_drive_speed;
+			drives_right_velocity = package.right_drive_speed;
+		}
+	}else{
+		osDelay(2);
+	}
+  }
+  /* USER CODE END StartPcTask */
+}
+
+/* StartButtonsTask function */
+void StartButtonsTask(void const * argument)
+{
+  /* USER CODE BEGIN StartButtonsTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartButtonsTask */
+}
+
+/* StartShutdownTask function */
+void StartShutdownTask(void const * argument)
+{
+  /* USER CODE BEGIN StartShutdownTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartShutdownTask */
+}
+
+/**
+  * @brief  Period elapsed callback in non blocking mode
+  * @note   This function is called  when TIM2 interrupt took place, inside
+  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
+  * a global variable "uwTick" used as application time base.
+  * @param  htim : TIM handle
+  * @retval None
+  */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+/* USER CODE BEGIN Callback 0 */
+
+/* USER CODE END Callback 0 */
+  if (htim->Instance == TIM2) {
+    HAL_IncTick();
+  }
+/* USER CODE BEGIN Callback 1 */
+
+/* USER CODE END Callback 1 */
+}
 
 /**
   * @brief  This function is executed in case of error occurrence.
