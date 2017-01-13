@@ -17,7 +17,9 @@ void LCD_writeControlValue(char valueDI, char valueRW){
 }
 
 void LCD_wait(){
-	asm("nop");asm("nop");asm("nop");asm("nop");
+	for(int i = 0; i < 1500; i++){
+		asm("nop");
+	}
 }
 
 void LCD_enablePulse(){

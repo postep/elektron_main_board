@@ -50,6 +50,7 @@
 #include "yahdlc/yahdlc.h"
 #include "circular_buffer.h"
 #include "nf/nfv2.h"
+#include "lcd.h"
 /* USER CODE END Includes */
 
 /* Private variables ---------------------------------------------------------*/
@@ -68,6 +69,13 @@ osThreadId motorsTaskHandle;
 osThreadId pcTaskHandle;
 osThreadId buttonsTaskHandle;
 osThreadId shutdownTaskHandle;
+osThreadId batteryTaskHandle;
+osThreadId setMotorsTaskHandle;
+osMessageQId shutdownQueueHandle;
+osMessageQId setMotorsQueueHandle;
+osMutexId batteryMutexHandle;
+osMutexId drivesSpeedMutexHandle;
+osMutexId drivesPositionMutexHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
@@ -143,6 +151,8 @@ void StartMotorsTask(void const * argument);
 void StartPcTask(void const * argument);
 void StartButtonsTask(void const * argument);
 void StartShutdownTask(void const * argument);
+void StartBatteryTask(void const * argument);
+void StartSetMotorsTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
@@ -245,6 +255,10 @@ int main(void)
   /* USER CODE BEGIN 2 */
     NFv2_CrcInit();
     NFv2_Config(&drives_NFCommunicationBuffer, 0x01);
+    HAL_ADC_Start(&hadc1);
+	if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK){
+		battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
+	}
     //drives connection init
     buffer_init(&uart2RxBuffer);
     HAL_GPIO_WritePin(USART2_TXEN_GPIO_Port, USART2_TXEN_Pin, GPIO_PIN_RESET);
@@ -261,6 +275,19 @@ int main(void)
     //HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
+
+  /* Create the mutex(es) */
+  /* definition and creation of batteryMutex */
+  osMutexDef(batteryMutex);
+  batteryMutexHandle = osMutexCreate(osMutex(batteryMutex));
+
+  /* definition and creation of drivesSpeedMutex */
+  osMutexDef(drivesSpeedMutex);
+  drivesSpeedMutexHandle = osMutexCreate(osMutex(drivesSpeedMutex));
+
+  /* definition and creation of drivesPositionMutex */
+  osMutexDef(drivesPositionMutex);
+  drivesPositionMutexHandle = osMutexCreate(osMutex(drivesPositionMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -299,9 +326,26 @@ int main(void)
   osThreadDef(shutdownTask, StartShutdownTask, osPriorityIdle, 0, 128);
   shutdownTaskHandle = osThreadCreate(osThread(shutdownTask), NULL);
 
+  /* definition and creation of batteryTask */
+  osThreadDef(batteryTask, StartBatteryTask, osPriorityIdle, 0, 128);
+  batteryTaskHandle = osThreadCreate(osThread(batteryTask), NULL);
+
+  /* definition and creation of setMotorsTask */
+  osThreadDef(setMotorsTask, StartSetMotorsTask, osPriorityHigh, 0, 128);
+  setMotorsTaskHandle = osThreadCreate(osThread(setMotorsTask), NULL);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
+
+  /* Create the queue(s) */
+  /* definition and creation of shutdownQueue */
+  osMessageQDef(shutdownQueue, 2, uint8_t);
+  shutdownQueueHandle = osMessageCreate(osMessageQ(shutdownQueue), NULL);
+
+  /* definition and creation of setMotorsQueue */
+  osMessageQDef(setMotorsQueue, 16, uint32_t);
+  setMotorsQueueHandle = osMessageCreate(osMessageQ(setMotorsQueue), NULL);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -321,13 +365,6 @@ int main(void)
     drives_right_velocity = 0;
   while (1)
   {
-
-		HAL_ADC_Start(&hadc1);
-		    if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK){
-		    	battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
-		    }else{
-		    	HAL_Delay(1);
-		    }
 		if(i == 10000){
 			int temp_l = drives_left_velocity;
 			int temp_r = drives_right_velocity;
@@ -557,44 +594,59 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : ST_LED_Pin */
-  GPIO_InitStruct.Pin = ST_LED_Pin;
+  /*Configure GPIO pins : ST_LED_Pin LCD_RST_Pin LCD_RW_Pin LCD_LED_Pin */
+  GPIO_InitStruct.Pin = ST_LED_Pin|LCD_RST_Pin|LCD_RW_Pin|LCD_LED_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(ST_LED_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pins : DIO1_Pin DIO2_Pin */
-  GPIO_InitStruct.Pin = DIO1_Pin|DIO2_Pin;
+  /*Configure GPIO pins : DIO1_Pin DIO2_Pin LCD_DB0_Pin */
+  GPIO_InitStruct.Pin = DIO1_Pin|DIO2_Pin|LCD_DB0_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /*Configure GPIO pins : DIO3_Pin DIO4_Pin DIO5_Pin DIO6_Pin 
-                           DIO7_Pin */
+                           DIO7_Pin LCD_DB4_Pin LCD_DB3_Pin LCD_DB2_Pin 
+                           LCD_DB1_Pin */
   GPIO_InitStruct.Pin = DIO3_Pin|DIO4_Pin|DIO5_Pin|DIO6_Pin 
-                          |DIO7_Pin;
+                          |DIO7_Pin|LCD_DB4_Pin|LCD_DB3_Pin|LCD_DB2_Pin 
+                          |LCD_DB1_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : USART2_TXEN_Pin */
-  GPIO_InitStruct.Pin = USART2_TXEN_Pin;
+  /*Configure GPIO pins : LCD_DB5_Pin LCD_DB6_Pin LCD_DB7_Pin LCD_CS1_Pin 
+                           LCD_CS2_Pin USART2_TXEN_Pin */
+  GPIO_InitStruct.Pin = LCD_DB5_Pin|LCD_DB6_Pin|LCD_DB7_Pin|LCD_CS1_Pin 
+                          |LCD_CS2_Pin|USART2_TXEN_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(USART2_TXEN_GPIO_Port, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : LCD_DI_Pin LCD_E_Pin */
+  GPIO_InitStruct.Pin = LCD_DI_Pin|LCD_E_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(ST_LED_GPIO_Port, ST_LED_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, ST_LED_Pin|LCD_RST_Pin|LCD_RW_Pin|LCD_LED_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOB, DIO1_Pin|DIO2_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, DIO1_Pin|DIO2_Pin|LCD_DB0_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOE, DIO3_Pin|DIO4_Pin|DIO5_Pin|DIO6_Pin 
-                          |DIO7_Pin, GPIO_PIN_RESET);
+                          |DIO7_Pin|LCD_DB4_Pin|LCD_DB3_Pin|LCD_DB2_Pin 
+                          |LCD_DB1_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(USART2_TXEN_GPIO_Port, USART2_TXEN_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOD, LCD_DB5_Pin|LCD_DB6_Pin|LCD_DB7_Pin|LCD_CS1_Pin 
+                          |LCD_CS2_Pin|USART2_TXEN_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOA, LCD_DI_Pin|LCD_E_Pin, GPIO_PIN_RESET);
 
 }
 
@@ -621,9 +673,29 @@ void StartOutTask(void const * argument)
 {
   /* USER CODE BEGIN StartOutTask */
   /* Infinite loop */
+	LCD_init();
+	LCD_clear();
   for(;;)
   {
-    osDelay(1);
+	int battery_copy = 0;
+	xSemaphoreTake(batteryMutexHandle, portMAX_DELAY);
+	battery_copy = battery_voltage_adc;
+	xSemaphoreGive(batteryMutexHandle);
+	if(battery_copy == 0){
+		LCD_writeLine(0, "POMIAR BAT. NIEDOSTEPNY");
+	}else{
+		int battery_int = battery_copy/100;
+		int battery_decimal = battery_copy%100;
+		char string[20];
+		sprintf(string, "Bateria:  %d.%dV     ", battery_int, battery_decimal);
+		LCD_writeLine(0, string);
+		if(battery_copy < 2200){
+			LCD_writeLine(1, "BATERIA ROZLADOWANA");
+		}else{
+			LCD_writeLine(1, "                   ");
+		}
+	}
+    osDelay(2000);
   }
   /* USER CODE END StartOutTask */
 }
@@ -679,8 +751,10 @@ void StartPcTask(void const * argument)
 		got_message = (got_message && package.tx_timestamp != last_timestamp);
 		if(got_message){
 			last_timestamp = package.tx_timestamp;
-			drives_left_velocity = package.left_drive_speed;
-			drives_right_velocity = package.right_drive_speed;
+			uint16_t speed[2];
+			speed[0] = package.left_drive_speed;
+			speed[1] = package.right_drive_speed;
+			xQueueSend(setMotorsQueueHandle, &speed, portTICK_PERIOD_MS);
 		}
 	}else{
 		osDelay(2);
@@ -708,9 +782,48 @@ void StartShutdownTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	uint8_t shutdownTime;
+	xQueueReceive(shutdownQueueHandle, &shutdownTime, portMAX_DELAY);
+    osDelay(1000*shutdownTime);
+    HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
   }
   /* USER CODE END StartShutdownTask */
+}
+
+/* StartBatteryTask function */
+void StartBatteryTask(void const * argument)
+{
+  /* USER CODE BEGIN StartBatteryTask */
+  /* Infinite loop */
+  for(;;)
+  {
+	HAL_ADC_Start(&hadc1);
+	if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK){
+		xSemaphoreTake(batteryMutexHandle, portTICK_RATE_MS*2);
+		battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
+		xSemaphoreGive(batteryMutexHandle);
+	}else{
+		osDelay(10);
+	}
+
+	osDelay(10000);
+  }
+  /* USER CODE END StartBatteryTask */
+}
+
+/* StartSetMotorsTask function */
+void StartSetMotorsTask(void const * argument)
+{
+  /* USER CODE BEGIN StartSetMotorsTask */
+  /* Infinite loop */
+  for(;;)
+  {
+	uint16_t speed[2];
+	xQueueReceive(setMotorsQueueHandle, speed, portMAX_DELAY);
+	drives_set_speed_request(speed[0], speed[1]);
+    osDelay(2);
+  }
+  /* USER CODE END StartSetMotorsTask */
 }
 
 /**
