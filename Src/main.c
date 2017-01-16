@@ -46,7 +46,7 @@
 #include "cmsis_os.h"
 
 /* USER CODE BEGIN Includes */
-//#include "lcd.h"
+#define HELP_B(x, y) if(!x && buttons[y] < 20){buttons[y]++;}; if(x && buttons[y] > 0){buttons[y]--;}
 #include "yahdlc/yahdlc.h"
 #include "circular_buffer.h"
 #include "nf/nfv2.h"
@@ -77,11 +77,14 @@ osMutexId batteryMutexHandle;
 osMutexId drivesSpeedMutexHandle;
 osMutexId drivesPositionMutexHandle;
 osMutexId relaysMutexHandle;
+osMutexId buttonsMutexHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 uint16_t battery_voltage_adc;
 uint8_t relays;
+uint8_t buttons[5];
+uint8_t buttons_register;
 Buffer uart4RxBuffer;
 char uart4TxBuffer[128];
 Buffer uart2RxBuffer;
@@ -255,11 +258,21 @@ int main(void)
   MX_TIM3_Init();
 
   /* USER CODE BEGIN 2 */
+  	  //init nf2, communication with drives
     NFv2_CrcInit();
     NFv2_Config(&drives_NFCommunicationBuffer, 0x01);
+
+    //init battery measure
     HAL_ADC_Start(&hadc1);
 	if(HAL_ADC_PollForConversion(&hadc1, 10) == HAL_OK){
 		battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
+	}
+
+	//init relays and buttons
+	relays = 0;
+	buttons_register = 0;
+	for(int i = 0; i < 5; i++){
+		buttons[i] = 0;
 	}
     //drives connection init
     buffer_init(&uart2RxBuffer);
@@ -294,6 +307,10 @@ int main(void)
   /* definition and creation of relaysMutex */
   osMutexDef(relaysMutex);
   relaysMutexHandle = osMutexCreate(osMutex(relaysMutex));
+
+  /* definition and creation of buttonsMutex */
+  osMutexDef(buttonsMutex);
+  buttonsMutexHandle = osMutexCreate(osMutex(buttonsMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -597,7 +614,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = KEY_1_Pin|KEY_2_Pin|KEY_3_Pin|KEY_4_Pin 
                           |KEY_5_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
 
   /*Configure GPIO pins : ST_LED_Pin LCD_RST_Pin LCD_RW_Pin LCD_LED_Pin */
@@ -744,7 +761,7 @@ void StartMotorsTask(void const * argument)
 	HAL_NVIC_EnableIRQ(USART2_IRQn);
 	if (newUart2Rx){
 		if(drives_rx_handler(uart2Rx)){
-			send_pc_response();
+			//send_pc_response();
 		}
 	}else{
 		osDelay(3);
@@ -801,7 +818,24 @@ void StartButtonsTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+	  uint8_t k1 = HAL_GPIO_ReadPin(KEY_1_GPIO_Port, KEY_1_Pin);
+	  uint8_t k2 = HAL_GPIO_ReadPin(KEY_2_GPIO_Port, KEY_2_Pin);
+	  uint8_t k3 = HAL_GPIO_ReadPin(KEY_3_GPIO_Port, KEY_3_Pin);
+	  uint8_t k4 = HAL_GPIO_ReadPin(KEY_4_GPIO_Port, KEY_4_Pin);
+	  uint8_t k5 = HAL_GPIO_ReadPin(KEY_5_GPIO_Port, KEY_5_Pin);
+	  HELP_B(k1, 0);
+	  HELP_B(k2, 1);
+	  HELP_B(k3, 2);
+	  HELP_B(k4, 3);
+	  HELP_B(k5, 4);
+	  xSemaphoreTake(buttonsMutexHandle, portTICK_PERIOD_MS*4);
+	  buttons_register = 0;
+	  for(int i = 4; i >= 0; --i){
+		  buttons_register <<= 1;
+		  buttons_register |= (buttons[i] > 10);
+	  }
+	  xSemaphoreGive(buttonsMutexHandle);
+	  osDelay(20);
   }
   /* USER CODE END StartButtonsTask */
 }
@@ -836,7 +870,6 @@ void StartBatteryTask(void const * argument)
 	}else{
 		osDelay(10);
 	}
-
 	osDelay(10000);
   }
   /* USER CODE END StartBatteryTask */
