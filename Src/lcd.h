@@ -17,7 +17,7 @@ void LCD_writeControlValue(char valueDI, char valueRW){
 }
 
 void LCD_wait(){
-	for(int i = 0; i < 1500; i++){
+	for(int i = 0; i < 100; i++){
 		asm("nop");
 	}
 }

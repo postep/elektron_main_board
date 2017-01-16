@@ -1,6 +1,6 @@
 /**
   ******************************************************************************
-  * File Name          : main.c
+9i  * File Name          : main.c
   * Description        : Main program body
   ******************************************************************************
   *
@@ -71,8 +71,10 @@ osThreadId buttonsTaskHandle;
 osThreadId shutdownTaskHandle;
 osThreadId batteryTaskHandle;
 osThreadId setMotorsTaskHandle;
+osThreadId pcRxTaskHandle;
 osMessageQId shutdownQueueHandle;
 osMessageQId setMotorsQueueHandle;
+osMessageQId sendPcResponseHandle;
 osMutexId batteryMutexHandle;
 osMutexId drivesSpeedMutexHandle;
 osMutexId drivesPositionMutexHandle;
@@ -82,7 +84,7 @@ osMutexId buttonsMutexHandle;
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
 uint16_t battery_voltage_adc;
-uint8_t relays;
+char relays;
 uint8_t buttons[5];
 uint8_t buttons_register;
 Buffer uart4RxBuffer;
@@ -158,6 +160,7 @@ void StartButtonsTask(void const * argument);
 void StartShutdownTask(void const * argument);
 void StartBatteryTask(void const * argument);
 void StartSetMotorsTask(void const * argument);
+void StartPcRxTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
 /* Private function prototypes -----------------------------------------------*/
@@ -207,8 +210,10 @@ int drives_rx_handler(char newRx){
 	drives_rxBuffer[drives_rxCount] = newRx;
 	if(NF_Interpreter(&drives_NFCommunicationBuffer, drives_rxBuffer, &drives_rxCount, drives_rxCommandArray, &drives_rxCommandCount) > 0){
 		if(drives_NFCommunicationBuffer.ReadDrivesPosition.updated){
+			xSemaphoreTake(drivesPositionMutexHandle, portTICK_PERIOD_MS);
 			drives_l_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[0];
 			drives_r_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[1];
+			xSemaphoreGive(drivesPositionMutexHandle);
 		 	drives_NFCommunicationBuffer.ReadDrivesPosition.updated=0;
 		 	ret = 1;
 		}
@@ -216,14 +221,19 @@ int drives_rx_handler(char newRx){
 	return ret;
 }
 
-void send_pc_response(){
+void send_pc_response(uint32_t* timestamp){
 	RxPackage package;
-	package.tx_timestamp = last_timestamp;
-	package.rx_timestamp = counter;
-	++counter;
+	package.tx_timestamp = *timestamp;
+	xSemaphoreTake(drivesPositionMutexHandle, portTICK_PERIOD_MS);
 	package.left_drive_position = drives_l_pos_total;
 	package.right_drive_position = drives_r_pos_total;
+	xSemaphoreGive(drivesPositionMutexHandle);
+	xSemaphoreTake(batteryMutexHandle, portTICK_RATE_MS/2);
 	package.battery = battery_voltage_adc;
+	xSemaphoreGive(batteryMutexHandle);
+	xSemaphoreTake(buttonsMutexHandle, portTICK_PERIOD_MS/2);
+	package.buttons = buttons_register;
+	xSemaphoreGive(buttonsMutexHandle);
 	yahdlc_control_t control;
 	// Initialize the control field structure with frame type and sequence number
 	control.frame = YAHDLC_FRAME_DATA;
@@ -357,6 +367,10 @@ int main(void)
   osThreadDef(setMotorsTask, StartSetMotorsTask, osPriorityHigh, 0, 128);
   setMotorsTaskHandle = osThreadCreate(osThread(setMotorsTask), NULL);
 
+  /* definition and creation of pcRxTask */
+  osThreadDef(pcRxTask, StartPcRxTask, osPriorityHigh, 0, 512);
+  pcRxTaskHandle = osThreadCreate(osThread(pcRxTask), NULL);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -369,6 +383,10 @@ int main(void)
   /* definition and creation of setMotorsQueue */
   osMessageQDef(setMotorsQueue, 16, uint32_t);
   setMotorsQueueHandle = osMessageCreate(osMessageQ(setMotorsQueue), NULL);
+
+  /* definition and creation of sendPcResponse */
+  osMessageQDef(sendPcResponse, 16, uint32_t);
+  sendPcResponseHandle = osMessageCreate(osMessageQ(sendPcResponse), NULL);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
@@ -388,17 +406,11 @@ int main(void)
     drives_right_velocity = 0;
   while (1)
   {
-		if(i == 10000){
-			int temp_l = drives_left_velocity;
-			int temp_r = drives_right_velocity;
-			drives_set_speed_request(temp_l, temp_r);
-			//HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
-			i = 0;
-		}
-		++i;
-		//HAL_Delay(2);
-	  //drives_set_speed_request(100, 100);
-	  //HAL_Delay(1);
+	if(i == 10000){
+		drives_set_speed_request(0, 0);
+		i = 0;
+	}
+	++i;
   /* USER CODE END WHILE */
 
   /* USER CODE BEGIN 3 */
@@ -701,9 +713,9 @@ void StartOutTask(void const * argument)
 	LCD_writeLine(4, "              1 2 3 4");
   for(;;)
   {
-	  uint8_t temp_relays = 0x55;
+	  uint8_t temp_relays = 0;
 	  xSemaphoreTake(relaysMutexHandle, portTICK_PERIOD_MS*4);
-	  //temp_relays = relays;
+	  temp_relays = relays;
 	  xSemaphoreGive(relaysMutexHandle);
 	  char rel1 = (temp_relays & 0x01);
 	  char rel2 = (temp_relays & 0x02);
@@ -723,7 +735,11 @@ void StartOutTask(void const * argument)
 		int battery_int = battery_copy/100;
 		int battery_decimal = battery_copy%100;
 		char string[20];
-		sprintf(string, "Bateria:      %d.%dV     ", battery_int, battery_decimal);
+		memcpy(string, "Bateria:        .  V   ", 24);
+		string[14] = battery_int/10 + '0';
+		string[15] = battery_int%10 + '0';
+		string[17] = battery_decimal/10 + '0';
+		string[18] = battery_decimal%10 + '0';
 		LCD_writeLine(0, string);
 		if(battery_copy < 2200){
 			LCD_writeLine(1, "BATERIA ROZLADOWANA");
@@ -802,7 +818,12 @@ void StartPcTask(void const * argument)
 			uint16_t speed[2];
 			speed[0] = package.left_drive_speed;
 			speed[1] = package.right_drive_speed;
+			xSemaphoreTake(relaysMutexHandle, portTICK_RATE_MS);
+			relays = package.relays;
+			xSemaphoreGive(relaysMutexHandle);
 			xQueueSend(setMotorsQueueHandle, &speed, portTICK_PERIOD_MS);
+			osDelay(2);
+			xQueueSend(sendPcResponseHandle, &package.tx_timestamp, portTICK_PERIOD_MS);
 		}
 	}else{
 		osDelay(2);
@@ -867,8 +888,6 @@ void StartBatteryTask(void const * argument)
 		xSemaphoreTake(batteryMutexHandle, portTICK_RATE_MS*2);
 		battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
 		xSemaphoreGive(batteryMutexHandle);
-	}else{
-		osDelay(10);
 	}
 	osDelay(10000);
   }
@@ -885,9 +904,24 @@ void StartSetMotorsTask(void const * argument)
 	uint16_t speed[2];
 	xQueueReceive(setMotorsQueueHandle, speed, portMAX_DELAY);
 	drives_set_speed_request(speed[0], speed[1]);
-    osDelay(2);
+    osDelay(3);
   }
   /* USER CODE END StartSetMotorsTask */
+}
+
+/* StartPcRxTask function */
+void StartPcRxTask(void const * argument)
+{
+  /* USER CODE BEGIN StartPcRxTask */
+  /* Infinite loop */
+  for(;;)
+  {
+	uint32_t timestamp;
+    xQueueReceive(sendPcResponseHandle, &timestamp, portMAX_DELAY);
+    send_pc_response(&timestamp);
+    osDelay(2);
+  }
+  /* USER CODE END StartPcRxTask */
 }
 
 /**
