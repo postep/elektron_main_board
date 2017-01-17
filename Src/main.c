@@ -1,6 +1,6 @@
 /**
   ******************************************************************************
-9i  * File Name          : main.c
+  * File Name          : main.c
   * Description        : Main program body
   ******************************************************************************
   *
@@ -80,9 +80,11 @@ osMutexId drivesSpeedMutexHandle;
 osMutexId drivesPositionMutexHandle;
 osMutexId relaysMutexHandle;
 osMutexId buttonsMutexHandle;
+osMutexId shutdownMutexHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
+uint8_t shutdown_received = 0;
 uint16_t battery_voltage_adc;
 char relays;
 uint8_t buttons[5];
@@ -321,6 +323,10 @@ int main(void)
   /* definition and creation of buttonsMutex */
   osMutexDef(buttonsMutex);
   buttonsMutexHandle = osMutexCreate(osMutex(buttonsMutex));
+
+  /* definition and creation of shutdownMutex */
+  osMutexDef(shutdownMutex);
+  shutdownMutexHandle = osMutexCreate(osMutex(shutdownMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -725,13 +731,13 @@ void StartOutTask(void const * argument)
 	  HAL_GPIO_WritePin(REL2_GPIO_Port, REL2_Pin, rel2);
 	  HAL_GPIO_WritePin(REL3_GPIO_Port, REL3_Pin, rel3);
 	  HAL_GPIO_WritePin(REL4_GPIO_Port, REL4_Pin, rel4);
-	int battery_copy = 0;
-	xSemaphoreTake(batteryMutexHandle, portMAX_DELAY);
-	battery_copy = battery_voltage_adc;
-	xSemaphoreGive(batteryMutexHandle);
-	if(battery_copy == 0){
+	  int battery_copy = 0;
+	  xSemaphoreTake(batteryMutexHandle, portMAX_DELAY);
+	  battery_copy = battery_voltage_adc;
+	  xSemaphoreGive(batteryMutexHandle);
+	  if(battery_copy == 0){
 		LCD_writeLine(0, "POMIAR BAT. NIEDOSTEPNY");
-	}else{
+	  }else{
 		int battery_int = battery_copy/100;
 		int battery_decimal = battery_copy%100;
 		char string[20];
@@ -741,7 +747,7 @@ void StartOutTask(void const * argument)
 		string[17] = battery_decimal/10 + '0';
 		string[18] = battery_decimal%10 + '0';
 		LCD_writeLine(0, string);
-		if(battery_copy < 2200){
+		if(battery_copy < 2300){
 			LCD_writeLine(1, "BATERIA ROZLADOWANA");
 		}else{
 			LCD_writeLine(1, "                   ");
@@ -759,6 +765,13 @@ void StartOutTask(void const * argument)
 	if (rel4) {relayString[20] = '*';} else {relayString[20] = '.';}
 	relayString[21] = '\0';
 	LCD_writeLine(5, relayString);
+	uint8_t temp_shutdown;
+	xSemaphoreTake(shutdownMutexHandle, portTICK_PERIOD_MS);
+	temp_shutdown = shutdown_received;
+	xSemaphoreGive(shutdownMutexHandle);
+	if(temp_shutdown){
+		LCD_writeLine(2, "WYLACZANIE");
+	}
     osDelay(2000);
   }
   /* USER CODE END StartOutTask */
@@ -818,12 +831,21 @@ void StartPcTask(void const * argument)
 			uint16_t speed[2];
 			speed[0] = package.left_drive_speed;
 			speed[1] = package.right_drive_speed;
-			xSemaphoreTake(relaysMutexHandle, portTICK_RATE_MS);
+			xSemaphoreTake(relaysMutexHandle, portTICK_PERIOD_MS);
 			relays = package.relays;
 			xSemaphoreGive(relaysMutexHandle);
 			xQueueSend(setMotorsQueueHandle, &speed, portTICK_PERIOD_MS);
-			osDelay(2);
 			xQueueSend(sendPcResponseHandle, &package.tx_timestamp, portTICK_PERIOD_MS);
+			xSemaphoreTake(shutdownMutexHandle, portTICK_PERIOD_MS*100);
+			uint8_t shutdown_message = 0;
+			if(!shutdown_received && package.shutdown){
+				shutdown_received = package.shutdown;
+				shutdown_message = package.shutdown;
+			}
+			xSemaphoreGive(shutdownMutexHandle);
+			if(shutdown_message){
+				xQueueSend(shutdownQueueHandle, &(shutdown_message), portTICK_PERIOD_MS*100);
+			}
 		}
 	}else{
 		osDelay(2);
@@ -871,7 +893,7 @@ void StartShutdownTask(void const * argument)
 	uint8_t shutdownTime;
 	xQueueReceive(shutdownQueueHandle, &shutdownTime, portMAX_DELAY);
     osDelay(1000*shutdownTime);
-    HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
+    HAL_GPIO_WritePin(ROBOT_OFF_GPIO_Port, ROBOT_OFF_Pin, GPIO_PIN_SET);
   }
   /* USER CODE END StartShutdownTask */
 }
@@ -888,6 +910,9 @@ void StartBatteryTask(void const * argument)
 		xSemaphoreTake(batteryMutexHandle, portTICK_RATE_MS*2);
 		battery_voltage_adc = 5*HAL_ADC_GetValue(&hadc1)/3.3;
 		xSemaphoreGive(batteryMutexHandle);
+		if(battery_voltage_adc != 0 && battery_voltage_adc < 2100){
+			HAL_GPIO_WritePin(ROBOT_OFF_GPIO_Port, ROBOT_OFF_Pin, GPIO_PIN_SET);
+		}
 	}
 	osDelay(10000);
   }
@@ -918,6 +943,7 @@ void StartPcRxTask(void const * argument)
   {
 	uint32_t timestamp;
     xQueueReceive(sendPcResponseHandle, &timestamp, portMAX_DELAY);
+	osDelay(2);
     send_pc_response(&timestamp);
     osDelay(2);
   }
