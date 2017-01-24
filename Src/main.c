@@ -81,6 +81,7 @@ osMutexId drivesPositionMutexHandle;
 osMutexId relaysMutexHandle;
 osMutexId buttonsMutexHandle;
 osMutexId shutdownMutexHandle;
+osMutexId communicationMutexHandle;
 
 /* USER CODE BEGIN PV */
 /* Private variables ---------------------------------------------------------*/
@@ -90,14 +91,15 @@ char relays;
 uint8_t buttons[5];
 uint8_t buttons_register;
 Buffer uart4RxBuffer;
-char uart4TxBuffer[128];
+char uart4TxBuffer[512];
 Buffer uart2RxBuffer;
 Buffer uart2TxBuffer;
 char uart4Received[64];
 char uart2Received;
 char uart4Tx;
-int drives_left_velocity = 0;
-int drives_right_velocity = 0;
+int8_t drives_left_speed = 0;
+int8_t drives_right_speed = 0;
+char communication_correct = 0;
 
 //Obiekty i struktury biblioteki NFv2
 NF_STRUCT_ComBuf drives_NFCommunicationBuffer;	//Bufor komunikacyjny biblioteki NFv2.
@@ -109,10 +111,8 @@ uint8_t drives_rxCommandArray[256];	//Tablica danych przychodz¹cych od p³ytki.
 uint8_t drives_rxCommandCount;	//Stopien zapelnienia tablicy danych od p³ytki.
 uint8_t drives_rxBuffer[256];	//Dane odebrane do plytki.
 uint8_t drives_rxCount = 0;		//Dlugosc danych odebranych od plytki.
-double drives_l_pos_total=0;	//Aktualna pozycja kola prawego w SI [m].
-double drives_r_pos_total=0;	//Aktualna pozycja kola lewego w SI [m].
-double drives_l_speed_pic = 0;
-double drives_r_speed_pic = 0;
+int32_t drives_l_pos_total=0;	//Aktualna pozycja kola prawego w SI [m].
+int32_t drives_r_pos_total=0;	//Aktualna pozycja kola lewego w SI [m].
 
 //Obiekty i struktury do komunikacji z pc
 char pc_rx_buffer[256];
@@ -120,29 +120,26 @@ short pc_rx_iter = 0;
 unsigned last_timestamp = 0;
 unsigned counter = 0;
 
-typedef struct{
-	unsigned id;
-	unsigned tx_timestamp;
-	unsigned rx_timestamp;
-	short left_drive_speed;
-	short right_drive_speed;
-	char relays;
-	char shutdown;
-	char sound;
-	//char lcd_segment;
-	//char lcd_message[13];
-}TxPackage;
+typedef struct
+{
+	uint32_t timestamp;
+	int8_t left_speed;
+	int8_t right_speed;
+	uint8_t relays;
+	uint8_t sound;
+	uint8_t shutdown;
+}TxFrame;
 
-typedef struct{
-	unsigned id;
-	unsigned tx_timestamp;
-	unsigned rx_timestamp;
-	double left_drive_position;
-	double right_drive_position;
-	char buttons;
-	char shutdown;
-	short battery;
-}RxPackage;
+typedef struct
+{
+	uint32_t timestamp;
+	uint16_t buttons;
+	int32_t left_position;
+	int32_t right_position;
+	uint16_t battery;
+	uint8_t error;
+}RxFrame;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -188,6 +185,14 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart){
 	}
 }
 
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart){
+	__HAL_UART_CLEAR_PEFLAG(huart);
+	__HAL_UART_CLEAR_NEFLAG(huart);
+	__HAL_UART_CLEAR_OREFLAG(huart);
+	__HAL_UART_FLUSH_DRREGISTER(huart);
+	//HAL_GPIO_TogglePin(ST_LED_GPIO_Port, ST_LED_Pin);
+}
+
 void drives_set_speed_request(int left, int right){
 	drives_commandCount = 0;
 	drives_NFCommunicationBuffer.SetDrivesMode.data[0] = NF_DrivesMode_SPEED;
@@ -224,11 +229,11 @@ int drives_rx_handler(char newRx){
 }
 
 void send_pc_response(uint32_t* timestamp){
-	RxPackage package;
-	package.tx_timestamp = *timestamp;
+	RxFrame package;
+	package.timestamp = *timestamp;
 	xSemaphoreTake(drivesPositionMutexHandle, portTICK_PERIOD_MS);
-	package.left_drive_position = drives_l_pos_total;
-	package.right_drive_position = drives_r_pos_total;
+	package.left_position = drives_l_pos_total;
+	package.right_position = drives_r_pos_total;
 	xSemaphoreGive(drivesPositionMutexHandle);
 	xSemaphoreTake(batteryMutexHandle, portTICK_RATE_MS/2);
 	package.battery = battery_voltage_adc;
@@ -241,8 +246,12 @@ void send_pc_response(uint32_t* timestamp){
 	control.frame = YAHDLC_FRAME_DATA;
 	// Create an empty frame with the control field information
 	unsigned frame_length;
-	yahdlc_frame_data(&control, (char *)(&package), sizeof(RxPackage), uart4TxBuffer, &frame_length);
-	HAL_UART_Transmit_DMA(&huart4, uart4TxBuffer, frame_length);
+	uart4TxBuffer[0] = 0x7e;
+	yahdlc_frame_data(&control, (char *)(&package), sizeof(RxFrame), uart4TxBuffer, &frame_length);
+	++frame_length;
+	memcpy(uart4TxBuffer+frame_length, uart4TxBuffer, frame_length);
+	memcpy(uart4TxBuffer+2*frame_length, uart4TxBuffer, frame_length);
+	HAL_UART_Transmit_DMA(&huart4, uart4TxBuffer, 3*frame_length);
 }
 /* USER CODE END 0 */
 
@@ -295,11 +304,9 @@ int main(void)
     //drives_set_speed_request(0, 0);
 
     //pc connection init
+
     buffer_init(&uart4RxBuffer);
     HAL_UART_Receive_DMA(&huart4, &uart4Received, sizeof(uart4Received));
-
-    //battery voltage measure init
-    //HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
 
@@ -327,6 +334,10 @@ int main(void)
   /* definition and creation of shutdownMutex */
   osMutexDef(shutdownMutex);
   shutdownMutexHandle = osMutexCreate(osMutex(shutdownMutex));
+
+  /* definition and creation of communicationMutex */
+  osMutexDef(communicationMutex);
+  communicationMutexHandle = osMutexCreate(osMutex(communicationMutex));
 
   /* USER CODE BEGIN RTOS_MUTEX */
   /* add mutexes, ... */
@@ -406,17 +417,9 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-    int i = 0;
-    int j = 0;
-    drives_left_velocity = 0;
-    drives_right_velocity = 0;
   while (1)
   {
-	if(i == 10000){
-		drives_set_speed_request(0, 0);
-		i = 0;
-	}
-	++i;
+
   /* USER CODE END WHILE */
 
   /* USER CODE BEGIN 3 */
@@ -716,7 +719,7 @@ void StartOutTask(void const * argument)
   /* Infinite loop */
 	LCD_init();
 	LCD_clear();
-	LCD_writeLine(4, "              1 2 3 4");
+	LCD_writeLine(5, "              1 2 3 4");
   for(;;)
   {
 	  uint8_t temp_relays = 0;
@@ -736,7 +739,7 @@ void StartOutTask(void const * argument)
 	  battery_copy = battery_voltage_adc;
 	  xSemaphoreGive(batteryMutexHandle);
 	  if(battery_copy == 0){
-		LCD_writeLine(0, "POMIAR BAT. NIEDOSTEPNY");
+		LCD_writeLine(1, "POMIAR BAT. NIEDOSTEPNY");
 	  }else{
 		int battery_int = battery_copy/100;
 		int battery_decimal = battery_copy%100;
@@ -746,11 +749,11 @@ void StartOutTask(void const * argument)
 		string[15] = battery_int%10 + '0';
 		string[17] = battery_decimal/10 + '0';
 		string[18] = battery_decimal%10 + '0';
-		LCD_writeLine(0, string);
+		LCD_writeLine(1, string);
 		if(battery_copy < 2300){
-			LCD_writeLine(1, "BATERIA ROZLADOWANA");
+			LCD_writeLine(2, "BATERIA ROZLADOWANA");
 		}else{
-			LCD_writeLine(1, "                   ");
+			LCD_writeLine(2, "                   ");
 		}
 	}
 	char relayString[21];
@@ -764,13 +767,22 @@ void StartOutTask(void const * argument)
 	if (rel3) {relayString[18] = '*';} else {relayString[18] = '.';}
 	if (rel4) {relayString[20] = '*';} else {relayString[20] = '.';}
 	relayString[21] = '\0';
-	LCD_writeLine(5, relayString);
+	LCD_writeLine(6, relayString);
 	uint8_t temp_shutdown;
 	xSemaphoreTake(shutdownMutexHandle, portTICK_PERIOD_MS);
 	temp_shutdown = shutdown_received;
 	xSemaphoreGive(shutdownMutexHandle);
 	if(temp_shutdown){
-		LCD_writeLine(2, "WYLACZANIE");
+		LCD_writeLine(3, "WYLACZANIE");
+	}
+	char temp_communication;
+	xSemaphoreTake(communicationMutexHandle, portTICK_PERIOD_MS);
+	temp_communication = communication_correct;
+	xSemaphoreGive(communicationMutexHandle);
+	if(communication_correct){
+		LCD_writeLine(0, "KOMUNIKACJA PC     ");
+	}else{
+		LCD_writeLine(0, "BRAK KOMUNIKACJI PC");
 	}
     osDelay(2000);
   }
@@ -789,11 +801,9 @@ void StartMotorsTask(void const * argument)
 	char newUart2Rx = buffer_get(&uart2RxBuffer, &uart2Rx);
 	HAL_NVIC_EnableIRQ(USART2_IRQn);
 	if (newUart2Rx){
-		if(drives_rx_handler(uart2Rx)){
-			//send_pc_response();
-		}
+		drives_rx_handler(uart2Rx);
 	}else{
-		osDelay(3);
+		osDelay(1);
 	}
   }
   /* USER CODE END StartMotorsTask */
@@ -804,6 +814,7 @@ void StartPcTask(void const * argument)
 {
   /* USER CODE BEGIN StartPcTask */
   /* Infinite loop */
+	char without_communication = 0;
   for(;;)
   {
 	NVIC_DisableIRQ(DMA2_Channel5_IRQn);
@@ -813,29 +824,38 @@ void StartPcTask(void const * argument)
 	if (newUart4Rx){
 		int got_message = 0;
 		unsigned int message_length = 0;
-		TxPackage package;
+		TxFrame package;
+		//memset(&package, 0, sizeof(package));
 		yahdlc_control_t control_recv;
 		pc_rx_buffer[pc_rx_iter] = uart4Rx;
-		pc_rx_iter++;
+		++pc_rx_iter;
 		pc_rx_iter &= 0xff;
-		if(pc_rx_iter >= sizeof(TxPackage)){
+		if(pc_rx_iter >= sizeof(TxFrame)){
 			yahdlc_get_data(&control_recv, pc_rx_buffer, pc_rx_iter, (char*)(&package), &message_length);
-			got_message = (message_length > 2);
+			got_message = (message_length == sizeof(TxFrame));
 		}
 		if(got_message){
 			pc_rx_iter = 0;
 		}
-		got_message = (got_message && package.tx_timestamp != last_timestamp);
+		got_message = (got_message && package.timestamp != last_timestamp);
 		if(got_message){
-			last_timestamp = package.tx_timestamp;
-			uint16_t speed[2];
-			speed[0] = package.left_drive_speed;
-			speed[1] = package.right_drive_speed;
+			xSemaphoreTake(communicationMutexHandle, portTICK_RATE_MS);
+			communication_correct = 1;
+			xSemaphoreGive(communicationMutexHandle);
+			without_communication = 0;
+			last_timestamp = package.timestamp;
+			int16_t speed[2];
+			speed[0] = package.left_speed;
+			speed[1] = package.right_speed;
 			xSemaphoreTake(relaysMutexHandle, portTICK_PERIOD_MS);
 			relays = package.relays;
 			xSemaphoreGive(relaysMutexHandle);
 			xQueueSend(setMotorsQueueHandle, &speed, portTICK_PERIOD_MS);
-			xQueueSend(sendPcResponseHandle, &package.tx_timestamp, portTICK_PERIOD_MS);
+			/*xSemaphoreTake(drivesSpeedMutexHandle, portTICK_PERIOD_MS);
+			drives_left_speed = package.left_speed;
+			drives_right_speed = package.right_speed;
+			xSemaphoreGive(drivesSpeedMutexHandle);*/
+			xQueueSend(sendPcResponseHandle, &package.timestamp, portTICK_PERIOD_MS);
 			xSemaphoreTake(shutdownMutexHandle, portTICK_PERIOD_MS*100);
 			uint8_t shutdown_message = 0;
 			if(!shutdown_received && package.shutdown){
@@ -848,7 +868,19 @@ void StartPcTask(void const * argument)
 			}
 		}
 	}else{
-		osDelay(2);
+		if(without_communication == 40){
+			uint16_t speed[2];
+			speed[0] = 0;
+			speed[1] = 0;
+			xQueueSend(setMotorsQueueHandle, &speed, 2*portTICK_PERIOD_MS);
+			xSemaphoreTake(communicationMutexHandle, portTICK_PERIOD_MS);
+			communication_correct = 0;
+			xSemaphoreGive(communicationMutexHandle);
+			++without_communication;
+		}else if (without_communication < 40){
+			++without_communication;
+		}
+		osDelay(1);
 	}
   }
   /* USER CODE END StartPcTask */
@@ -926,10 +958,15 @@ void StartSetMotorsTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-	uint16_t speed[2];
+	int16_t speed[2];
 	xQueueReceive(setMotorsQueueHandle, speed, portMAX_DELAY);
+	/*uint8_t left, right;
+	xSemaphoreTake(drivesSpeedMutexHandle, portTICK_PERIOD_MS);
+	left = drives_left_speed;
+	right = drives_right_speed;
+	xSemaphoreGive(drivesSpeedMutexHandle);*/
 	drives_set_speed_request(speed[0], speed[1]);
-    osDelay(3);
+    osDelay(2);
   }
   /* USER CODE END StartSetMotorsTask */
 }
@@ -945,7 +982,6 @@ void StartPcRxTask(void const * argument)
     xQueueReceive(sendPcResponseHandle, &timestamp, portMAX_DELAY);
 	osDelay(2);
     send_pc_response(&timestamp);
-    osDelay(2);
   }
   /* USER CODE END StartPcRxTask */
 }

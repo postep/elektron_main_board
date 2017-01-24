@@ -40,3 +40,7 @@ int buffer_get(Buffer *b, char *c){
 	}
 	return ret;
 }
+
+void buffer_clear(Buffer *b){
+	buffer_init(b);
+}
