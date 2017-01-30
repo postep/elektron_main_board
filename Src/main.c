@@ -123,8 +123,8 @@ unsigned counter = 0;
 typedef struct
 {
 	uint32_t timestamp;
-	int8_t left_speed;
-	int8_t right_speed;
+	int16_t left_speed;
+	int16_t right_speed;
 	uint8_t relays;
 	uint8_t sound;
 	uint8_t shutdown;
@@ -218,8 +218,8 @@ int drives_rx_handler(char newRx){
 	if(NF_Interpreter(&drives_NFCommunicationBuffer, drives_rxBuffer, &drives_rxCount, drives_rxCommandArray, &drives_rxCommandCount) > 0){
 		if(drives_NFCommunicationBuffer.ReadDrivesPosition.updated){
 			xSemaphoreTake(drivesPositionMutexHandle, portTICK_PERIOD_MS);
-			drives_l_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[0];
-			drives_r_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[1];
+			drives_l_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[1];
+			drives_r_pos_total = drives_NFCommunicationBuffer.ReadDrivesPosition.data[0];
 			xSemaphoreGive(drivesPositionMutexHandle);
 		 	drives_NFCommunicationBuffer.ReadDrivesPosition.updated=0;
 		 	ret = 1;
@@ -868,7 +868,7 @@ void StartPcTask(void const * argument)
 			}
 		}
 	}else{
-		if(without_communication == 40){
+		if(without_communication == 100){
 			uint16_t speed[2];
 			speed[0] = 0;
 			speed[1] = 0;
@@ -877,7 +877,7 @@ void StartPcTask(void const * argument)
 			communication_correct = 0;
 			xSemaphoreGive(communicationMutexHandle);
 			++without_communication;
-		}else if (without_communication < 40){
+		}else if (without_communication < 100){
 			++without_communication;
 		}
 		osDelay(1);
